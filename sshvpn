@@ -1,0 +1,259 @@
+#!/bin/bash
+#
+# SSHVPN
+# 
+# A Purely client-side SSH-based vpn solution that requires no end-point
+# configuration and minimal client-side setup.
+#
+# Version 0.1
+# Dean M Rantala <deanrantala@gmail.com>
+#
+# Prerequisites:
+# 1) Must have sufficient privileges on target host to manipulate IP tables, manage TUN devices, routes, etc
+# 2) The above account must have DIRECT privileges, NOT via sudo.
+# 3) The above account must have SSH keys installed, tested and working.
+#
+# Basically, you will typically run this script so that you are connecting to the endpoint as
+# the root user.  Most all distributions will - by default - allow root login using SSH keys.
+#
+# Once you have configured root SSH login using public key auth (which you likely already have),
+# you only need to configure the basic network details desired.  Each configuration option is
+# detailed below.
+#
+
+# Endpoint SSH Host and User.
+#
+# Note: it will likely be easiest to simply use the root user.
+#
+connect_host='50.234.53.84'
+connect_user='root'
+
+# Endpoint SSH Port (SSH default is usually 22)
+#
+connect_port='22'
+
+# Local tun device to use
+#
+# You can usually leave this value as-is
+# unless you need to explicitly set something
+# else for conflicting reasons
+#
+local_tun='1'
+remote_tun='1'
+
+# Local VPN addresses to use for the
+# point-to-point connection.
+#
+# These two addresses are used for the routing of the host<->host communication.
+# All traffic to/from the remote network is abstracted (via NAT), so the network
+# you configure here simply needs to be a unique for the VPN tunnel.
+#
+local_vpn_addr='10.0.15.2'
+remote_vpn_addr='10.0.15.1'
+vpn_netmask='255.255.255.252'
+
+# Optional remote networks you want added to the LOCAL routing
+# table on this end (the client side).  
+#
+# SSHVPN will, for each network/mask defined below, add a local route sending traffic for the route to the
+# configured tun endpoint (configured above).  The endpoint gets IP forwarding enabled, and all traffic from
+# your local network will be SNAT'ed. 
+#
+# The format is:
+# local_routes=( "192.168.0.1/24" "10.0.1.0/24")
+# 
+# As an example, if the remote endpoint is connected to the 192.168.0.0/24 network - and you want access to this network,
+# you are going to have a single entry as such:
+#
+# local_routes=( "192.168.0.1/24" )
+#
+# IMPORTANT: Be sure that the remote network you want access to does NOT overlap or conflict with any existing networks already
+# configured locally!  In cases such as this, you may provide per-host routes such as 192.168.0.20/32.  This way, only the remote
+# hosts you need access to are routed.
+local_routes=( "192.168.0.0/24" )
+
+# Enable full outbound (remote network) access via SNAT
+#
+# This rule will configure IP forwarding and SNAT on the end-point
+# to enable you access to all remote network resources.  It will
+# do this via SNAT so all requests will look to be comming from
+# the remote host you are connected to.  This eliminates the need for
+# the other hosts on the remote network to need complex routing or special
+# configuration at the firewall/router.
+#
+# You probably want to leave this at 1.  This is obviously required if you want access to any of the remote
+# networks defined above (local_routes) you wish to access.
+#
+snat_outbound=1
+
+# Enable full inbound routed and NAT access
+#
+# This option enables full INBOUND access FROM the remote network
+# to all detected networks the local machine is connected to via
+# SNAT.  You will still likely need to configure a route or two
+# on the remote end if the host you are connected to is not already
+# a defaulty gateway, but this will set everything up locally. This
+# feature is still largely un-tested and kinda experimental.
+#
+snat_inbound=0
+
+#
+# Optional remote routes to push to the endpoint
+#
+# This option is only usefull if you are going to enable
+# inbound connections since NAT will likely need to be
+# set up (unless you are configuring additional routes
+# on your network), but is offered as a seperate option
+# that enables the defined routes regardless of the
+# enable_inbound config setting.
+#
+# Example: remote_routes=( "10.0.0.0/24" )
+#
+remote_routes=( )
+
+# ------------------------------------------------------------
+#                   END OF CONFIGURATION
+#                No need to edit below here
+# ------------------------------------------------------------
+
+mode=$1
+
+# Establish persistent SSH connection in multiplex mode for our query commands
+if [ ! -e /var/run/sshvpn ]
+then
+	# Use normal SSH mode
+	ssh -M -S /var/run/sshvpn -f -p $connect_port -w ${local_tun}:${remote_tun} root@${connect_host} /bin/bash
+	# Use autossh mode
+	# -> I have had too much issue doing it this way, plus it adds an extra dependancy.  YMMV
+	#autossh -M 0 -f -S /var/run/sshvpn -o ControlMaster=yes -o ControlPersist=no -p $connect_port -w ${local_tun}:${remote_tun} root@${connect_host} /bin/bash
+	#ssh -M -S /var/run/sshvpn -f -p $connect_port root@${connect_host} /bin/bash
+fi
+
+ssh_cmd="ssh -S /var/run/sshvpn -p $connect_port root@${connect_host}";
+
+remote_interfaces=$( $ssh_cmd ifconfig | grep 'Link encap:Ethernet' | grep -v -E 'tun|lo' | awk '{print $1}' )
+local_interfaces=$( ifconfig | grep 'Link encap:Ethernet' | grep -v -E 'tun|lo' | awk '{print $1}' )
+
+declare -A local_networks
+declare -A remote_networks
+
+for iface in $local_interfaces
+do
+	ip=$( ifconfig $iface | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}' )
+	local_networks[$iface]=$ip
+done
+
+for iface in $remote_interfaces
+do
+	ip=$( $ssh_cmd ifconfig $iface | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}' )
+	remote_networks[$iface]=$ip
+done
+
+
+
+startvpn() {
+	
+	connect_command="ifconfig tun${remote_tun} up $remote_vpn_addr netmask $vpn_netmask"
+	
+	if [ "$snat_outbound" == 1 ]
+	then
+		connect_command="${connect_command} && echo 1 > /proc/sys/net/ipv4/ip_forward"
+		for iface in "${!remote_networks[@]}"
+		do
+			connect_command="${connect_command} && /sbin/iptables -t nat -A POSTROUTING -s ${local_vpn_addr}/32 -o $iface -j SNAT --to-source ${remote_networks[$iface]}"
+		done
+	fi
+	
+	for local_network in ${remote_routes[@]}
+	do
+		connect_command="${connect_command} && ip route add ${local_network} via ${local_vpn_addr}";
+		if [ "$snat_outbound" == 1 ]
+		then
+			for iface in "${!remote_networks[@]}"
+			do
+				connect_command="${connect_command} && /sbin/iptables -t nat -A POSTROUTING -s $local_network -o $iface -j SNAT --to-source ${remote_networks[$iface]}";
+			done
+		fi
+	done
+
+	$ssh_cmd "${connect_command}"
+
+	ifconfig tun${local_tun} up $local_vpn_addr netmask $vpn_netmask
+
+	for remote_network in ${local_routes[@]}
+	do
+		ip route add $remote_network via $remote_vpn_addr
+	done
+
+	if [ "$snat_inbound" == 1 ]
+	then
+		echo 1 > /proc/sys/net/ipv4/ip_forward
+		for iface in "${!local_networks[@]}"
+		do
+			/sbin/iptables -t nat -A POSTROUTING -s ${remote_vpn_addr}/32 -o $iface -j SNAT --to-source ${local_networks[$iface]}
+		done
+	fi
+
+}
+
+stopvpn() {
+
+	for iface in "${!remote_networks[@]}"
+	do
+		$ssh_cmd /sbin/iptables -t nat -D POSTROUTING -s ${local_vpn_addr}/32 -o $iface -j SNAT --to-source ${remote_networks[$iface]}
+	done
+
+	for local_network in ${remote_routes[@]}
+	do
+		for iface in "${!remote_networks[@]}"
+		do
+			$ssh_cmd /sbin/iptables -t nat -D POSTROUTING -s $local_network -o $iface -j SNAT --to-source ${remote_networks[$iface]}
+		done
+	done
+
+	if [ "$snat_inbound" == 1 ]
+	then
+		for iface in "${!local_networks[@]}"
+		do
+			/sbin/iptables -t nat -D POSTROUTING -s ${remote_vpn_addr}/32 -o $iface -j SNAT --to-source ${local_networks[$iface]}
+		done
+	fi
+
+	ssh -O exit -S /var/run/sshvpn -p $connect_port root@${connect_host}
+
+}
+
+if [ $mode == "start" ]
+then
+
+	net_exists=`grep "tun${local_tun}" /proc/net/dev`
+	if [ ! -n "$net_exists" ]
+	then
+		echo "TUN device tun${local_tun} not found, aborting!"
+		exit
+	fi
+
+	net_exists=`ifconfig tun${local_tun} | grep 'inet'`
+	if [ -n "$net_exists" ]
+	then
+		echo "VPN Network already running, aborting!"
+		exit
+	fi
+
+	echo "Starting VPN..."
+	startvpn
+	echo "VPN Started!";
+
+elif [ $mode == "stop" ]
+then
+	if [ ! -e /var/run/sshvpn ]
+	then
+		echo "No SSH tunnel connection found, aborting!"
+		exit
+	fi
+	echo "Shutting down VPN..."
+	stopvpn
+	echo "VPN has been shut down";
+fi
+
+
